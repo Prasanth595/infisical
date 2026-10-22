@@ -1234,10 +1234,17 @@ const OverviewPageContent = () => {
 
   const [recentQuickAddKeys, setRecentQuickAddKeys] = useState<string[]>([]);
   const hadPendingBatchChangesRef = useRef(hasPendingBatchChanges);
+  const isRecentQuickAddClearPendingRef = useRef(false);
   useEffect(() => {
-    if (hadPendingBatchChangesRef.current && !hasPendingBatchChanges) setRecentQuickAddKeys([]);
+    if (hadPendingBatchChangesRef.current && !hasPendingBatchChanges)
+      isRecentQuickAddClearPendingRef.current = true;
+    if (hasPendingBatchChanges) isRecentQuickAddClearPendingRef.current = false;
     hadPendingBatchChangesRef.current = hasPendingBatchChanges;
-  }, [hasPendingBatchChanges]);
+    if (isRecentQuickAddClearPendingRef.current && activeTableRows.size === 0) {
+      isRecentQuickAddClearPendingRef.current = false;
+      setRecentQuickAddKeys([]);
+    }
+  }, [hasPendingBatchChanges, activeTableRows]);
   useEffect(() => {
     setRecentQuickAddKeys([]);
   }, [secretPath, singleVisibleEnv?.slug]);
@@ -2297,29 +2304,33 @@ const OverviewPageContent = () => {
   };
 
   // Batch mode: merged data for display
-  const mergedSecKeys = useMemo(() => {
-    if (!isSingleEnvView) return secKeys;
+  const { quickAddedSecKeys, sortedSecKeys } = useMemo(() => {
+    if (!isSingleEnvView) return { quickAddedSecKeys: [], sortedSecKeys: secKeys };
 
     // If resource filter is active, secrets are excluded, and no tag filter is active, don't add pending creates
-    if (isFilteredByResources && !filter.secret && !activeTagSlugs.length) return secKeys;
+    if (isFilteredByResources && !filter.secret && !activeTagSlugs.length)
+      return { quickAddedSecKeys: [], sortedSecKeys: secKeys };
 
     const recentKeys = new Set(recentQuickAddKeys);
-    const result = secKeys.filter((key) => !recentKeys.has(key));
     const searchLower = searchFilter.trim().toLowerCase();
     const matchesSearch = (key: string) => !searchLower || key.toLowerCase().includes(searchLower);
-    const pendingCreateKeys = new Set<string>();
-    pendingChanges.secrets.forEach((change) => {
-      if (change.type !== PendingAction.Create) return;
-      pendingCreateKeys.add(change.secretKey);
-      if (!recentKeys.has(change.secretKey) && !result.includes(change.secretKey)) {
-        if (matchesSearch(change.secretKey)) result.unshift(change.secretKey);
-      }
+    const pendingCreateKeys = new Set(
+      pendingChanges.secrets.flatMap((change) =>
+        change.type === PendingAction.Create ? [change.secretKey] : []
+      )
+    );
+    const quickAdded =
+      page === 1
+        ? recentQuickAddKeys.filter(
+            (key) => secKeys.includes(key) || (pendingCreateKeys.has(key) && matchesSearch(key))
+          )
+        : [];
+    const quickAddedSet = new Set(quickAdded);
+    const sorted = secKeys.filter((key) => !quickAddedSet.has(key));
+    pendingCreateKeys.forEach((key) => {
+      if (!recentKeys.has(key) && !sorted.includes(key) && matchesSearch(key)) sorted.unshift(key);
     });
-    recentQuickAddKeys.forEach((key) => {
-      if (secKeys.includes(key) || (pendingCreateKeys.has(key) && matchesSearch(key)))
-        result.push(key);
-    });
-    return result;
+    return { quickAddedSecKeys: quickAdded, sortedSecKeys: sorted };
   }, [
     recentQuickAddKeys,
     secKeys,
@@ -2327,8 +2338,14 @@ const OverviewPageContent = () => {
     pendingChanges.secrets,
     searchFilter,
     isFilteredByResources,
-    filter.secret
+    filter.secret,
+    page
   ]);
+
+  const mergedSecKeys = useMemo(
+    () => [...quickAddedSecKeys, ...sortedSecKeys],
+    [quickAddedSecKeys, sortedSecKeys]
+  );
 
   const quickAddReservedKeys = useMemo(
     () => [
@@ -2928,14 +2945,15 @@ const OverviewPageContent = () => {
 
   const selectableRows = useMemo(
     () => [
+      ...quickAddedSecKeys.map((key) => ({ type: EntryType.SECRET, key })),
       ...mergedFolderNamesAndDescriptions.map(({ name: key }) => ({
         type: EntryType.FOLDER,
         key
       })),
       ...secretRotationNames.map((key) => ({ type: EntryType.SECRET_ROTATION, key })),
-      ...mergedSecKeys.map((key) => ({ type: EntryType.SECRET, key }))
+      ...sortedSecKeys.map((key) => ({ type: EntryType.SECRET, key }))
     ],
-    [mergedFolderNamesAndDescriptions, secretRotationNames, mergedSecKeys]
+    [quickAddedSecKeys, mergedFolderNamesAndDescriptions, secretRotationNames, sortedSecKeys]
   );
 
   const toggleSelectedEntry = useCallback(
@@ -3341,11 +3359,43 @@ const OverviewPageContent = () => {
     </button>
   );
 
+  const renderSecretRow = (key: string, rowKey: string) => (
+    <SecretTableRow
+      isSelected={!hasPendingBatchChanges && Boolean(selectedEntries.secret[key])}
+      onToggleSecretSelect={(_, isShiftKey) => {
+        if (!hasPendingBatchChanges) toggleSelectedEntry(EntryType.SECRET, key, isShiftKey);
+      }}
+      secretPath={secretPath}
+      getImportedSecretByKey={getImportedSecretByKey}
+      isImportedSecretPresentInEnv={handleIsImportedSecretPresentInEnv}
+      onSecretCreate={handleSecretCreate}
+      onSecretDelete={handleSecretDelete}
+      onSecretUpdate={handleSecretUpdate}
+      key={rowKey}
+      environments={visibleEnvs}
+      secretKey={key}
+      getSecretByKey={getSecretByKeyWithPending}
+      importedBy={importedBy}
+      isSingleEnvSecretsVisible={isSingleEnvSecretsVisible}
+      onBatchRevert={handleBatchRevert}
+      onPendingSave={handlePendingSecretSave}
+      isSelectionDisabled={hasPendingBatchChanges}
+      onCopySecret={handleCopySecret}
+      onAccessInsightsUpgrade={() =>
+        openUpgradeGate({
+          intent: SecretAccessInsightsUpgradeIntent
+        })
+      }
+      activityId={getTableRowActivityId("secret", key)}
+      onActivityChange={handleTableRowActivityChange}
+      timestampSortField={isTimestampSort ? orderBy : undefined}
+    />
+  );
+
   const hasPendingCreates =
     mergedSecKeys.length > secKeys.length ||
     mergedFolderNamesAndDescriptions.some((f) => f.pendingAction === PendingAction.Create);
   const isTableEmpty = totalCount === 0 && !hasPendingCreates && !isOverviewPending;
-  const isLastPage = offset + perPage >= totalCount;
   const isTagFilterEmpty =
     activeTagSlugs.length > 0 &&
     mergedSecKeys.length === 0 &&
@@ -4131,6 +4181,58 @@ const OverviewPageContent = () => {
                       ))
                     ) : (
                       <>
+                        {visibleEnvs.length > 0 &&
+                          tableView === "table" &&
+                          canCreateSecretsInAllVisibleEnvs &&
+                          page === 1 &&
+                          !isTableEmpty && (
+                            <QuickAddSecretRow
+                              autoQueueOnBlur={isSingleEnvView}
+                              activityId={getTableRowActivityId("quick-add", secretPath)}
+                              environments={visibleEnvs.map((env) => env.slug)}
+                              existingSecretKeys={quickAddReservedKeys}
+                              onActivityChange={handleTableRowActivityChange}
+                              saveLabel={quickAddSaveLabel}
+                              onCreateSecret={(environment, key, value, comment, isDirectSave) => {
+                                if (isSingleEnvView)
+                                  setRecentQuickAddKeys((prev) =>
+                                    prev.includes(key) ? prev : [...prev, key]
+                                  );
+                                return handleSecretCreate(
+                                  environment,
+                                  key,
+                                  value,
+                                  SecretType.Shared,
+                                  comment,
+                                  "quick-add",
+                                  isDirectSave
+                                );
+                              }}
+                              onPasteSecrets={(env) => {
+                                overviewTelemetry.flow({
+                                  action: "import",
+                                  resourceType: "mixed",
+                                  source: "paste",
+                                  phase: "input-received",
+                                  countBucket: overviewCountBucket(Object.keys(env).length)
+                                });
+                                setImportParsedSecrets(env);
+                                setImportSecretsInitialStep("paste");
+                                handlePopUpOpen("importSecrets");
+                              }}
+                              renderResourceTypeTrigger={(isDisabled) => (
+                                <AddResourceButtons
+                                  {...addResourceButtonsProps}
+                                  isDisabled={isDisabled}
+                                  variant="object-type"
+                                />
+                              )}
+                              secretPath={secretPath}
+                            />
+                          )}
+                        {quickAddedSecKeys.map((key, index) =>
+                          renderSecretRow(key, `overview-quick-added-${key}-${index + 1}`)
+                        )}
                         {isSingleEnvView &&
                           sortableImportItems.map((imp, idx) => (
                             <SecretImportTableRow
@@ -4332,41 +4434,9 @@ const OverviewPageContent = () => {
                             }
                           />
                         ))}
-                        {mergedSecKeys.map((key, index) => (
-                          <SecretTableRow
-                            isSelected={
-                              !hasPendingBatchChanges && Boolean(selectedEntries.secret[key])
-                            }
-                            onToggleSecretSelect={(_, isShiftKey) => {
-                              if (!hasPendingBatchChanges)
-                                toggleSelectedEntry(EntryType.SECRET, key, isShiftKey);
-                            }}
-                            secretPath={secretPath}
-                            getImportedSecretByKey={getImportedSecretByKey}
-                            isImportedSecretPresentInEnv={handleIsImportedSecretPresentInEnv}
-                            onSecretCreate={handleSecretCreate}
-                            onSecretDelete={handleSecretDelete}
-                            onSecretUpdate={handleSecretUpdate}
-                            key={`overview-${key}-${index + 1}`}
-                            environments={visibleEnvs}
-                            secretKey={key}
-                            getSecretByKey={getSecretByKeyWithPending}
-                            importedBy={importedBy}
-                            isSingleEnvSecretsVisible={isSingleEnvSecretsVisible}
-                            onBatchRevert={handleBatchRevert}
-                            onPendingSave={handlePendingSecretSave}
-                            isSelectionDisabled={hasPendingBatchChanges}
-                            onCopySecret={handleCopySecret}
-                            onAccessInsightsUpgrade={() =>
-                              openUpgradeGate({
-                                intent: SecretAccessInsightsUpgradeIntent
-                              })
-                            }
-                            activityId={getTableRowActivityId("secret", key)}
-                            onActivityChange={handleTableRowActivityChange}
-                            timestampSortField={isTimestampSort ? orderBy : undefined}
-                          />
-                        ))}
+                        {sortedSecKeys.map((key, index) =>
+                          renderSecretRow(key, `overview-${key}-${index + 1}`)
+                        )}
                         {tableView === "table" && (
                           <SecretNoAccessTableRow
                             environments={visibleEnvs}
@@ -4383,55 +4453,6 @@ const OverviewPageContent = () => {
                             )}
                           />
                         )}
-                        {visibleEnvs.length > 0 &&
-                          tableView === "table" &&
-                          canCreateSecretsInAllVisibleEnvs &&
-                          isLastPage &&
-                          !isTableEmpty && (
-                            <QuickAddSecretRow
-                              autoQueueOnBlur={isSingleEnvView}
-                              activityId={getTableRowActivityId("quick-add", secretPath)}
-                              environments={visibleEnvs.map((env) => env.slug)}
-                              existingSecretKeys={quickAddReservedKeys}
-                              onActivityChange={handleTableRowActivityChange}
-                              saveLabel={quickAddSaveLabel}
-                              onCreateSecret={(environment, key, value, comment, isDirectSave) => {
-                                if (isSingleEnvView)
-                                  setRecentQuickAddKeys((prev) =>
-                                    prev.includes(key) ? prev : [...prev, key]
-                                  );
-                                return handleSecretCreate(
-                                  environment,
-                                  key,
-                                  value,
-                                  SecretType.Shared,
-                                  comment,
-                                  "quick-add",
-                                  isDirectSave
-                                );
-                              }}
-                              onPasteSecrets={(env) => {
-                                overviewTelemetry.flow({
-                                  action: "import",
-                                  resourceType: "mixed",
-                                  source: "paste",
-                                  phase: "input-received",
-                                  countBucket: overviewCountBucket(Object.keys(env).length)
-                                });
-                                setImportParsedSecrets(env);
-                                setImportSecretsInitialStep("paste");
-                                handlePopUpOpen("importSecrets");
-                              }}
-                              renderResourceTypeTrigger={(isDisabled) => (
-                                <AddResourceButtons
-                                  {...addResourceButtonsProps}
-                                  isDisabled={isDisabled}
-                                  variant="object-type"
-                                />
-                              )}
-                              secretPath={secretPath}
-                            />
-                          )}
                         {tableView === "table" && isTableEmpty && (
                           <TableEmptyRow
                             colSpan={visibleEnvs.length + 2}
