@@ -132,6 +132,9 @@ is one
 - **Reach is the intersection of the user's and the identity's** (`intersectAccessBundleIds`): a bundle needs both,
   through the admin role or a grant, at mint and on every resolve. Settled with the product owner. The identity losing
   a grant drops the bundle's services like a user's lost grant, with no 401.
+- **Listing access bundles with `onBehalfOfUserId` or `onBehalfOfUserEmail` runs mint's delegation and user checks**
+  (`agent-vault-on-behalf-of-fns.ts`, shared by both), then returns the bundles the user and the identity both reach,
+  with setup state from the user's personal values, so an orchestrator can choose a bundle before it mints.
 - **Mint checks the delegation, then the identity's own bundles, then the user**, so an identity learns nothing about
   who is in the org until an admin has delegated it and granted it the bundle, and an unknown user gets the same message
   as an uncovered one. Only a machine identity may send `onBehalfOf`. The user must be an active, accepted org member,

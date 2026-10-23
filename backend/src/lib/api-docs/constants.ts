@@ -4489,6 +4489,10 @@ export const AGENT_VAULT = {
     servicesRequiringSetup:
       "The services in this access bundle that still require your personal values. Counted only for access bundles granted to you, so empty for one you reach only as an admin.",
     servicesRequiringSetupId: "The ID of the service, for setting your personal values on it.",
+    onBehalfOfUserId:
+      "List the access bundles a session on behalf of this user could use: those both the user and your machine identity can use. requiresSetup and servicesRequiringSetup then refer to the user's personal values. Only a machine identity whose delegation covers the user can do this. Set this or onBehalfOfUserEmail, not both.",
+    onBehalfOfUserEmail:
+      "Like onBehalfOfUserId, naming the user by email address instead. Set this or onBehalfOfUserId, not both.",
     servicesRequiringSetupName: "The name of the service."
   },
   SERVICE: {

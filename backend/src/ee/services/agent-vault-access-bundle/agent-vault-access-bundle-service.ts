@@ -46,13 +46,22 @@ import {
   TAgentVaultMemberProvidedField
 } from "../agent-vault/agent-vault-enums";
 import { ownerOrNullOf } from "../agent-vault/agent-vault-owner-fns";
-import { getAgentVaultGrantedReachability, getAgentVaultReachability } from "../agent-vault/agent-vault-permission";
+import {
+  getAgentVaultGrantedReachability,
+  getAgentVaultReachability,
+  intersectAccessBundleIds
+} from "../agent-vault/agent-vault-permission";
 import {
   findStoredVariableIds,
   findVariableKeys,
   toStoredVariableReferences,
   toVariableReference
 } from "../agent-vault/agent-vault-variable-fns";
+import {
+  findCallerDelegation,
+  resolveOnBehalfOfUser,
+  TOnBehalfOfDeps
+} from "../agent-vault-delegation/agent-vault-on-behalf-of-fns";
 import { TAgentVaultMemberDALFactory } from "../agent-vault-member/agent-vault-member-dal";
 import { TAgentVaultPersonalValueDALFactory } from "../agent-vault-personal-value/agent-vault-personal-value-dal";
 import {
@@ -119,6 +128,9 @@ type TAgentVaultAccessBundleServiceFactoryDep = {
   agentVaultMemberDAL: Pick<TAgentVaultMemberDALFactory, "findProductMembers">;
   userGroupMembershipDAL: Pick<TUserGroupMembershipDALFactory, "find">;
   identityGroupMembershipDAL: Pick<TIdentityGroupMembershipDALFactory, "find">;
+  agentVaultDelegationDAL: TOnBehalfOfDeps["agentVaultDelegationDAL"];
+  orgDAL: TOnBehalfOfDeps["orgDAL"];
+  userDAL: TOnBehalfOfDeps["userDAL"];
 } & TAgentVaultActorNameDALs;
 
 export type TAgentVaultAccessBundleServiceFactory = ReturnType<typeof agentVaultAccessBundleServiceFactory>;
@@ -151,7 +163,9 @@ export const agentVaultAccessBundleServiceFactory = (deps: TAgentVaultAccessBund
     identityGroupMembershipDAL,
     userDAL,
     groupDAL,
-    identityDAL
+    identityDAL,
+    agentVaultDelegationDAL,
+    orgDAL
   } = deps;
 
   const bundleScope = (projectId: string, accessBundleId: string) => ({
@@ -588,17 +602,44 @@ export const agentVaultAccessBundleServiceFactory = (deps: TAgentVaultAccessBund
 
   // Setup is counted over the bundles granted to the caller, the ones they take on. An admin reaches every bundle,
   // but one they were never granted asks nothing of them until they open it.
-  const listAccessBundles = async ({ projectId, ctx, requiresSetup, ...page }: TListAccessBundlesDTO) => {
-    const { permission, accessBundleIds, grantedAccessBundleIds } = await getAgentVaultGrantedReachability(
-      { permissionService, membershipDAL },
-      { projectId, ctx }
+  // What a session on the user's behalf could use: the bundles both the user and the caller reach, set up with the
+  // user's personal values. It runs the same checks as minting that session, so it reveals no more about the org.
+  const $onBehalfOfListScope = async ({
+    projectId,
+    ctx,
+    onBehalfOf,
+    callerAccessBundleIds
+  }: {
+    projectId: string;
+    ctx: TListAccessBundlesDTO["ctx"];
+    onBehalfOf: NonNullable<TListAccessBundlesDTO["onBehalfOf"]>;
+    callerAccessBundleIds: string[] | null;
+  }) => {
+    const delegation = await findCallerDelegation({ agentVaultDelegationDAL }, { projectId, ctx });
+    const { user, accessBundleIds: userAccessBundleIds } = await resolveOnBehalfOfUser(
+      { agentVaultDelegationDAL, userDAL, orgDAL, permissionService, membershipDAL },
+      { projectId, ctx, onBehalfOf, delegation }
     );
-    ForbiddenError.from(permission).throwUnlessCan(
+    const reachable = intersectAccessBundleIds(userAccessBundleIds, callerAccessBundleIds);
+    const accessBundleIds =
+      reachable ?? (await agentVaultAccessBundleDAL.find({ projectId })).map((bundle) => bundle.id);
+    return { accessBundleIds, setupAccessBundleIds: accessBundleIds, owner: { userId: user.id } };
+  };
+
+  const listAccessBundles = async ({ projectId, ctx, requiresSetup, onBehalfOf, ...page }: TListAccessBundlesDTO) => {
+    const caller = await getAgentVaultGrantedReachability({ permissionService, membershipDAL }, { projectId, ctx });
+    ForbiddenError.from(caller.permission).throwUnlessCan(
       ProjectPermissionAgentVaultAccessBundleActions.Read,
       ProjectPermissionSub.AgentVaultAccessBundles
     );
 
-    const owner = ownerOrNullOf(ctx);
+    const { accessBundleIds, setupAccessBundleIds, owner } = onBehalfOf
+      ? await $onBehalfOfListScope({ projectId, ctx, onBehalfOf, callerAccessBundleIds: caller.accessBundleIds })
+      : {
+          accessBundleIds: caller.accessBundleIds,
+          setupAccessBundleIds: caller.grantedAccessBundleIds,
+          owner: ownerOrNullOf(ctx)
+        };
     const pendingByBundleOf = async (bundleIds: string[]) => {
       const byBundle = new Map<string, { id: string; name: string }[]>();
       if (!owner || !bundleIds.length) return byBundle;
@@ -621,7 +662,7 @@ export const agentVaultAccessBundleServiceFactory = (deps: TAgentVaultAccessBund
 
     // Either filter needs every granted bundle's status before it can page; the plain list only needs the page's.
     if (requiresSetup !== undefined) {
-      const pendingByBundle = await pendingByBundleOf(grantedAccessBundleIds);
+      const pendingByBundle = await pendingByBundleOf(setupAccessBundleIds);
       const pendingIds = [...pendingByBundle.keys()];
       const { accessBundles, totalCount } = await agentVaultAccessBundleDAL.findForList({
         projectId,
@@ -642,9 +683,9 @@ export const agentVaultAccessBundleServiceFactory = (deps: TAgentVaultAccessBund
       accessBundleIds,
       ...page
     });
-    const granted = new Set(grantedAccessBundleIds);
+    const counted = new Set(setupAccessBundleIds);
     const pendingByBundle = await pendingByBundleOf(
-      accessBundles.map((bundle) => bundle.id).filter((id) => granted.has(id))
+      accessBundles.map((bundle) => bundle.id).filter((id) => counted.has(id))
     );
     return {
       accessBundles: accessBundles.map((bundle) => ({
