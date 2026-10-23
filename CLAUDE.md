@@ -148,6 +148,16 @@ for product vocabulary only: resolving the resource a request names, notificatio
 Any rule about what is *allowed* belongs in the resource, or the product's own API and the shared API
 stop agreeing.
 
+Auto-approval rules (`approval-policy/auto-approval/`) live on the policy and are evaluated once in
+`createRequest`, outside any transaction, failing closed. Another service becomes checkable by adding a
+provider to `AUTO_APPROVAL_PROVIDER_REGISTRY`, keyed by its App Connection, not by per-product code. A
+resource gates them per request with `allowsAutoApproval`. A policy may have rules and no approvers (no
+steps): then a request no rule approves is refused at submission, and only break-glass gets past it. The
+engine itself adds a reuse check (`not-used-before`) to every input, answered from the policy's approved
+requests' evidence and claimed under an advisory lock in the auto-approve transaction. The
+stored evidence holds data fetched from that service, so responses return only its outcome (`autoApproval`),
+never `autoApprovalEvidence`.
+
 ### API Layer (Frontend)
 
 React Query + Axios with query key factories per domain. Each API domain in `frontend/src/hooks/api/` has `queries.tsx`, `mutations.tsx`, and `types.tsx` — see `frontend/CLAUDE.md` for conventions.
