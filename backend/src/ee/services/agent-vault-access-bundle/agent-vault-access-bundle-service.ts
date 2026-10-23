@@ -34,10 +34,7 @@ import {
   TAgentVaultActorNameDALs
 } from "../agent-vault/agent-vault-actor-name-fns";
 import { describeConflict, findHostPatternConflicts } from "../agent-vault/agent-vault-conflict-fns";
-import {
-  AgentVaultBearerConfigSchema,
-  TAgentVaultCredentialConfig
-} from "../agent-vault/agent-vault-credential-schemas";
+import { TAgentVaultCredentialConfig } from "../agent-vault/agent-vault-credential-schemas";
 import { isUniqueViolation } from "../agent-vault/agent-vault-db-error-fns";
 import {
   AgentVaultCredentialType,
@@ -45,9 +42,11 @@ import {
   AgentVaultMemberType,
   AgentVaultResourceRole,
   AgentVaultSubstitutionSurface,
-  AgentVaultVariableReferenceField
+  AgentVaultVariableReferenceField,
+  TAgentVaultMemberProvidedField
 } from "../agent-vault/agent-vault-enums";
-import { getAgentVaultReachability } from "../agent-vault/agent-vault-permission";
+import { ownerOrNullOf } from "../agent-vault/agent-vault-owner-fns";
+import { getAgentVaultGrantedReachability, getAgentVaultReachability } from "../agent-vault/agent-vault-permission";
 import {
   findStoredVariableIds,
   findVariableKeys,
@@ -55,11 +54,18 @@ import {
   toVariableReference
 } from "../agent-vault/agent-vault-variable-fns";
 import { TAgentVaultMemberDALFactory } from "../agent-vault-member/agent-vault-member-dal";
+import { TAgentVaultPersonalValueDALFactory } from "../agent-vault-personal-value/agent-vault-personal-value-dal";
+import {
+  clearPersonalValuesAfterRevoke,
+  sameMemberProvidedFields
+} from "../agent-vault-personal-value/agent-vault-personal-value-fns";
+import { TAgentVaultPersonalValueServiceFactory } from "../agent-vault-personal-value/agent-vault-personal-value-service";
 import { TAgentVaultVariableDALFactory } from "../agent-vault-variable/agent-vault-variable-dal";
 import { TAgentVaultAccessBundleActorRef, TAgentVaultAccessBundleDALFactory } from "./agent-vault-access-bundle-dal";
 import {
   TAddMembersDTO,
-  TAgentVaultCredentialInput,
+  TAgentVaultBasicMemberField,
+  TAgentVaultBearerMemberField,
   TAgentVaultCredentialSummary,
   TAgentVaultCredentialUpdate,
   TAgentVaultVariableReferenceSummary,
@@ -74,6 +80,14 @@ import {
   TUpdateAccessBundleDTO,
   TUpdateServiceDTO
 } from "./agent-vault-access-bundle-types";
+import {
+  isStoredSecretReplaced,
+  mergeCredential,
+  needsStoredSecretFor,
+  nextMemberFieldsOf,
+  splitCredential,
+  TCredentialWrite
+} from "./agent-vault-credential-write-fns";
 import { TAgentVaultServiceCustomHeaderDALFactory } from "./agent-vault-service-custom-header-dal";
 import { TAgentVaultServiceDALFactory } from "./agent-vault-service-dal";
 import { TAgentVaultServiceSubstitutionDALFactory } from "./agent-vault-service-substitution-dal";
@@ -88,8 +102,13 @@ type TAgentVaultAccessBundleServiceFactoryDep = {
   agentVaultServiceDAL: TAgentVaultServiceDALFactory;
   agentVaultServiceCustomHeaderDAL: TAgentVaultServiceCustomHeaderDALFactory;
   agentVaultServiceSubstitutionDAL: TAgentVaultServiceSubstitutionDALFactory;
-  agentVaultVariableDAL: Pick<TAgentVaultVariableDALFactory, "findKeysByProjectId" | "lockForReference">;
+  agentVaultVariableDAL: Pick<TAgentVaultVariableDALFactory, "findKeys" | "lockForReference">;
   agentVaultServiceVariableReferenceDAL: TAgentVaultServiceVariableReferenceDALFactory;
+  agentVaultPersonalValueDAL: Pick<
+    TAgentVaultPersonalValueDALFactory,
+    "delete" | "deleteForServiceExceptFields" | "deleteForActorsWithoutGrant"
+  >;
+  agentVaultPersonalValueService: Pick<TAgentVaultPersonalValueServiceFactory, "findStatusesForOwner">;
   permissionService: Pick<TPermissionServiceFactory, "getProjectPermission">;
   kmsService: Pick<TKmsServiceFactory, "createCipherPairWithDataKey">;
   membershipDAL: Pick<
@@ -121,6 +140,8 @@ export const agentVaultAccessBundleServiceFactory = (deps: TAgentVaultAccessBund
     agentVaultServiceSubstitutionDAL,
     agentVaultVariableDAL,
     agentVaultServiceVariableReferenceDAL,
+    agentVaultPersonalValueDAL,
+    agentVaultPersonalValueService,
     permissionService,
     kmsService,
     membershipDAL,
@@ -297,91 +318,22 @@ export const agentVaultAccessBundleServiceFactory = (deps: TAgentVaultAccessBund
   const getProjectCipher = (projectId: string) =>
     kmsService.createCipherPairWithDataKey({ type: KmsDataKey.SecretManager, projectId });
 
-  // `null` clears the sealed column, `undefined` leaves it alone. $decryptCredential reads a NULL secret
-  // as passthrough, so the two are not interchangeable.
-  type TCredentialWrite = { config: TAgentVaultCredentialConfig; secret: Record<string, string> | null | undefined };
-
-  const splitCredential = (credential: TAgentVaultCredentialInput): TCredentialWrite => {
-    switch (credential.type) {
-      case AgentVaultCredentialType.Bearer: {
-        const config = AgentVaultBearerConfigSchema.parse({
-          headerName: credential.headerName,
-          headerPrefix: credential.headerPrefix
-        });
-        return { config: { type: credential.type, ...config }, secret: { value: credential.value } };
-      }
-      case AgentVaultCredentialType.Basic: {
-        if (!credential.username && !credential.password) {
-          throw new BadRequestError({ message: "A basic credential needs a username, a password, or both" });
-        }
-        return {
-          config: { type: credential.type },
-          secret: { username: credential.username, password: credential.password }
-        };
-      }
-      default:
-        return { config: { type: AgentVaultCredentialType.Passthrough }, secret: null };
-    }
-  };
-
-  const mergeCredential = (
-    credential: TAgentVaultCredentialUpdate,
-    stored: TAgentVaultServices,
-    storedSecret: Record<string, string> | null
-  ): TCredentialWrite => {
-    if (credential.type !== stored.credentialType) {
-      if (credential.type === AgentVaultCredentialType.Bearer && credential.value === undefined) {
-        throw new BadRequestError({
-          message:
-            "Provide a new token when changing the credential type to bearer. The stored secret belongs to the previous type"
-        });
-      }
-      return splitCredential(
-        credential.type === AgentVaultCredentialType.Basic
-          ? { type: credential.type, username: credential.username ?? "", password: credential.password ?? "" }
-          : (credential as TAgentVaultCredentialInput)
-      );
-    }
-
-    const prev = (stored.credentialConfig ?? {}) as { headerName?: string; headerPrefix?: string };
-
-    switch (credential.type) {
-      case AgentVaultCredentialType.Bearer:
-        return {
-          config: {
-            type: credential.type,
-            headerName: credential.headerName ?? prev.headerName ?? "Authorization",
-            headerPrefix: credential.headerPrefix ?? prev.headerPrefix ?? ""
-          },
-          secret: credential.value === undefined ? undefined : { value: credential.value }
-        };
-      case AgentVaultCredentialType.Basic: {
-        if (credential.username === undefined && credential.password === undefined) {
-          return { config: { type: credential.type }, secret: undefined };
-        }
-        const username = credential.username ?? storedSecret?.username ?? "";
-        const password = credential.password ?? storedSecret?.password ?? "";
-        if (!username && !password) {
-          throw new BadRequestError({ message: "A basic credential needs a username, a password, or both" });
-        }
-        return { config: { type: credential.type }, secret: { username, password } };
-      }
-      default:
-        return { config: { type: AgentVaultCredentialType.Passthrough }, secret: null };
-    }
-  };
-
   const summarizeCredential = (service: TAgentVaultServices): TAgentVaultCredentialSummary => {
     const config = service.credentialConfig as Record<string, string>;
+    const memberProvidedFields = service.memberProvidedFields ?? [];
     switch (service.credentialType as AgentVaultCredentialType) {
       case AgentVaultCredentialType.Bearer:
         return {
           type: AgentVaultCredentialType.Bearer,
           headerName: config.headerName,
-          headerPrefix: config.headerPrefix
+          headerPrefix: config.headerPrefix,
+          memberProvidedFields: memberProvidedFields as TAgentVaultBearerMemberField[]
         };
       case AgentVaultCredentialType.Basic:
-        return { type: AgentVaultCredentialType.Basic };
+        return {
+          type: AgentVaultCredentialType.Basic,
+          memberProvidedFields: memberProvidedFields as TAgentVaultBasicMemberField[]
+        };
       default:
         return { type: AgentVaultCredentialType.Passthrough };
     }
@@ -484,7 +436,7 @@ export const agentVaultAccessBundleServiceFactory = (deps: TAgentVaultAccessBund
       return { idOfKey: new Map<string, string>(), variableIds: new Set<string>() };
     }
 
-    const variables = await agentVaultVariableDAL.findKeysByProjectId(projectId);
+    const variables = await agentVaultVariableDAL.findKeys({ projectId, owner: null });
     const idOfKey = new Map(variables.map((variable) => [variable.key, variable.id]));
 
     texts.forEach(({ label, text }) => {
@@ -576,7 +528,7 @@ export const agentVaultAccessBundleServiceFactory = (deps: TAgentVaultAccessBund
   ) => {
     if (!rows.length) return;
     const variableIds = [...new Set(rows.map((row) => row.variableId))];
-    const present = await agentVaultVariableDAL.lockForReference({ projectId, variableIds }, tx);
+    const present = await agentVaultVariableDAL.lockForReference({ projectId, owner: null, variableIds }, tx);
     if (present.length !== variableIds.length) {
       throw new BadRequestError({ message: VARIABLE_DELETED_DURING_SAVE_MESSAGE });
     }
@@ -634,8 +586,10 @@ export const agentVaultAccessBundleServiceFactory = (deps: TAgentVaultAccessBund
     return { bundle, ...reachability };
   };
 
-  const listAccessBundles = async ({ projectId, ctx, ...page }: TListAccessBundlesDTO) => {
-    const { permission, accessBundleIds } = await getAgentVaultReachability(
+  // Setup is counted over the bundles granted to the caller, the ones they take on. An admin reaches every bundle,
+  // but one they were never granted asks nothing of them until they open it.
+  const listAccessBundles = async ({ projectId, ctx, requiresSetup, ...page }: TListAccessBundlesDTO) => {
+    const { permission, accessBundleIds, grantedAccessBundleIds } = await getAgentVaultGrantedReachability(
       { permissionService, membershipDAL },
       { projectId, ctx }
     );
@@ -644,7 +598,61 @@ export const agentVaultAccessBundleServiceFactory = (deps: TAgentVaultAccessBund
       ProjectPermissionSub.AgentVaultAccessBundles
     );
 
-    return agentVaultAccessBundleDAL.findForList({ projectId, accessBundleIds, ...page });
+    const owner = ownerOrNullOf(ctx);
+    const pendingByBundleOf = async (bundleIds: string[]) => {
+      const byBundle = new Map<string, { id: string; name: string }[]>();
+      if (!owner || !bundleIds.length) return byBundle;
+      const statuses = await agentVaultPersonalValueService.findStatusesForOwner({
+        projectId,
+        owner,
+        accessBundleIds: bundleIds,
+        withVariableReferences: false
+      });
+      statuses
+        .filter((status) => !status.isConfigured)
+        .forEach((status) =>
+          byBundle.set(status.accessBundleId, [
+            ...(byBundle.get(status.accessBundleId) ?? []),
+            { id: status.serviceId, name: status.serviceName }
+          ])
+        );
+      return byBundle;
+    };
+
+    // Either filter needs every granted bundle's status before it can page; the plain list only needs the page's.
+    if (requiresSetup !== undefined) {
+      const pendingByBundle = await pendingByBundleOf(grantedAccessBundleIds);
+      const pendingIds = [...pendingByBundle.keys()];
+      const { accessBundles, totalCount } = await agentVaultAccessBundleDAL.findForList({
+        projectId,
+        ...(requiresSetup ? { accessBundleIds: pendingIds } : { accessBundleIds, excludeAccessBundleIds: pendingIds }),
+        ...page
+      });
+      return {
+        accessBundles: accessBundles.map((bundle) => ({
+          ...bundle,
+          servicesRequiringSetup: pendingByBundle.get(bundle.id) ?? []
+        })),
+        totalCount
+      };
+    }
+
+    const { accessBundles, totalCount } = await agentVaultAccessBundleDAL.findForList({
+      projectId,
+      accessBundleIds,
+      ...page
+    });
+    const granted = new Set(grantedAccessBundleIds);
+    const pendingByBundle = await pendingByBundleOf(
+      accessBundles.map((bundle) => bundle.id).filter((id) => granted.has(id))
+    );
+    return {
+      accessBundles: accessBundles.map((bundle) => ({
+        ...bundle,
+        servicesRequiringSetup: pendingByBundle.get(bundle.id) ?? []
+      })),
+      totalCount
+    };
   };
 
   const getAccessBundleById = async (dto: TGetAccessBundleDTO) => {
@@ -666,6 +674,14 @@ export const agentVaultAccessBundleServiceFactory = (deps: TAgentVaultAccessBund
       undefined,
       { withVariableReferences: canReadVariables }
     );
+    const owner = ownerOrNullOf(dto.ctx);
+    const statuses = owner
+      ? await agentVaultPersonalValueService.findStatusesForOwner({
+          projectId: dto.projectId,
+          owner,
+          accessBundleIds: [bundle.id]
+        })
+      : [];
 
     return {
       id: bundle.id,
@@ -680,7 +696,13 @@ export const agentVaultAccessBundleServiceFactory = (deps: TAgentVaultAccessBund
           substitutions.filter((substitution) => substitution.serviceId === service.id),
           variableReferences.filter((reference) => reference.serviceId === service.id)
         );
-        return canReadVariables ? projected : { ...projected, variableReferences: undefined };
+        const status = statuses.find((entry) => entry.serviceId === service.id);
+        return {
+          ...projected,
+          ...(canReadVariables ? {} : { variableReferences: undefined }),
+          // The caller's own values, null when the admin sets the whole credential.
+          personalValues: status ? { isConfigured: status.isConfigured, fields: status.fields } : null
+        };
       })
     };
   };
@@ -831,9 +853,7 @@ export const agentVaultAccessBundleServiceFactory = (deps: TAgentVaultAccessBund
     const store = (text: string) => toStoredVariableReferences(text, idOfKey);
 
     // Encrypt before the lock: KMS is a network call and the transaction has to stay short.
-    const { config, secret } = splitCredential(
-      storeCredentialReferences(credential, store) as TAgentVaultCredentialInput
-    );
+    const { config, secret, memberProvidedFields } = splitCredential(storeCredentialReferences(credential, store));
     assertCustomHeadersDoNotShadowCredential(config, customHeaders);
 
     const { encryptor } = await getProjectCipher(rest.projectId);
@@ -879,7 +899,8 @@ export const agentVaultAccessBundleServiceFactory = (deps: TAgentVaultAccessBund
             allowedPathPrefixes: allowedPathPrefixes ?? null,
             credentialType: credential.type,
             credentialConfig: config,
-            encryptedCredential
+            encryptedCredential,
+            memberProvidedFields
           },
           tx
         );
@@ -990,13 +1011,16 @@ export const agentVaultAccessBundleServiceFactory = (deps: TAgentVaultAccessBund
       });
     }
 
-    // A partial basic update keeps the other half from the sealed secret read here, before the lock, so the write
-    // re-checks under the lock that nothing replaced it since.
-    const needsStoredSecret =
-      credential?.type === AgentVaultCredentialType.Basic &&
-      service.credentialType === AgentVaultCredentialType.Basic &&
-      (credential.username === undefined) !== (credential.password === undefined) &&
-      Boolean(service.encryptedCredential);
+    // A basic update that rewrites the secret keeps any admin half it left out from the sealed secret read here,
+    // before the lock, so the write re-checks under the lock that nothing replaced it since. A half that was
+    // member-provided has nothing stored to keep.
+    const previousMemberFields = (service.memberProvidedFields ?? []) as TAgentVaultMemberProvidedField[];
+    const nextMemberFields = credential ? nextMemberFieldsOf(credential, service) : null;
+    const credentialTypeChanged = credential !== undefined && credential.type !== service.credentialType;
+    const memberFieldsChanged =
+      credentialTypeChanged ||
+      (credential !== undefined && !sameMemberProvidedFields(nextMemberFields, previousMemberFields));
+    const needsStoredSecret = credential !== undefined && needsStoredSecretFor(credential, service);
     const storedSecretCipher = needsStoredSecret ? await getProjectCipher(rest.projectId) : null;
     const storedSecret = storedSecretCipher
       ? (JSON.parse(
@@ -1025,9 +1049,14 @@ export const agentVaultAccessBundleServiceFactory = (deps: TAgentVaultAccessBund
     let credentialUpdate = {};
     // Undefined leaves the sealed secret, and the references read off it, as they are.
     let writtenSecret: TCredentialWrite["secret"];
+    let credentialReplaced = false;
     let effectiveCredentialConfig = service.credentialConfig as TAgentVaultCredentialConfig;
     if (credential) {
-      const { config, secret } = mergeCredential(storeCredentialReferences(credential, store), service, storedSecret);
+      const { config, secret, memberProvidedFields } = mergeCredential(
+        storeCredentialReferences(credential, store),
+        service,
+        storedSecret
+      );
       let encryptedCredential: Buffer | null | undefined;
       if (secret === null) encryptedCredential = null;
       if (secret) {
@@ -1035,10 +1064,12 @@ export const agentVaultAccessBundleServiceFactory = (deps: TAgentVaultAccessBund
         encryptedCredential = encryptor({ plainText: Buffer.from(JSON.stringify(secret)) }).cipherTextBlob;
       }
       writtenSecret = secret;
+      credentialReplaced = isStoredSecretReplaced(credential, service, secret);
 
       credentialUpdate = {
         credentialType: credential.type,
         credentialConfig: config,
+        memberProvidedFields,
         ...(encryptedCredential === undefined ? {} : { encryptedCredential })
       };
       effectiveCredentialConfig = config;
@@ -1104,7 +1135,11 @@ export const agentVaultAccessBundleServiceFactory = (deps: TAgentVaultAccessBund
           if (!current) throw new NotFoundError({ message: `Service with ID '${serviceId}' not found` });
           const secretChanged =
             storedSecret !== null && !current.encryptedCredential?.equals(service.encryptedCredential!);
-          if (current.credentialType !== service.credentialType || secretChanged) {
+          if (
+            current.credentialType !== service.credentialType ||
+            !sameMemberProvidedFields(current.memberProvidedFields, service.memberProvidedFields) ||
+            secretChanged
+          ) {
             throw new ConflictError({ message: CREDENTIAL_CHANGED_DURING_SAVE_MESSAGE });
           }
         }
@@ -1146,6 +1181,20 @@ export const agentVaultAccessBundleServiceFactory = (deps: TAgentVaultAccessBund
               tx
             )
           : service;
+
+        // A saved value goes only when it no longer applies: a new credential type drops every one, and a field the
+        // admin takes back drops that field's. A field members still provide keeps what they saved. The update above
+        // wrote the service row, which is what a personal values save waits on.
+        if (memberFieldsChanged) {
+          if (credentialTypeChanged || !nextMemberFields?.length) {
+            await agentVaultPersonalValueDAL.delete({ serviceId: service.id }, tx);
+          } else {
+            await agentVaultPersonalValueDAL.deleteForServiceExceptFields(
+              { serviceId: service.id, keepFields: nextMemberFields },
+              tx
+            );
+          }
+        }
 
         // Outside the lock, two concurrent PATCHes both pass the ownership check and the loser's writes no-op.
         const applyDiff = async <TRow extends { id: string; encryptedValue: Buffer }, TColumns>(
@@ -1292,7 +1341,8 @@ export const agentVaultAccessBundleServiceFactory = (deps: TAgentVaultAccessBund
         result.updatedSubstitutions,
         result.variableReferences
       ),
-      accessBundleName: bundle.name
+      accessBundleName: bundle.name,
+      credentialReplaced
     };
   };
 
@@ -1478,6 +1528,17 @@ export const agentVaultAccessBundleServiceFactory = (deps: TAgentVaultAccessBund
 
       const rows = held.map((actor) => heldByKey.get(actorKey(actor))!);
       await membershipDAL.delete({ $in: { id: rows.map((row) => row.id) } }, tx);
+      await clearPersonalValuesAfterRevoke(
+        { agentVaultPersonalValueDAL, userGroupMembershipDAL, identityGroupMembershipDAL },
+        {
+          projectId: rest.projectId,
+          accessBundleId: bundle.id,
+          userIds: rows.flatMap((row) => (row.actorUserId ? [row.actorUserId] : [])),
+          identityIds: rows.flatMap((row) => (row.actorIdentityId ? [row.actorIdentityId] : [])),
+          groupIds: rows.flatMap((row) => (row.actorGroupId ? [row.actorGroupId] : []))
+        },
+        tx
+      );
       return { removed: rows, skipped };
     });
 

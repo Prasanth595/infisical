@@ -821,6 +821,8 @@ export enum EventType {
   AGENT_VAULT_VARIABLE_UPDATE = "agent-vault-variable-update",
   AGENT_VAULT_VARIABLE_DELETE = "agent-vault-variable-delete",
   AGENT_VAULT_VARIABLE_VALUE_VIEW = "agent-vault-variable-value-view",
+  AGENT_VAULT_PERSONAL_VALUES_SET = "agent-vault-personal-values-set",
+  AGENT_VAULT_PERSONAL_VALUES_DELETE = "agent-vault-personal-values-delete",
   AGENT_VAULT_MEMBER_ADD = "agent-vault-member-add",
   AGENT_VAULT_MEMBER_UPDATE = "agent-vault-member-update",
   AGENT_VAULT_MEMBER_REMOVE = "agent-vault-member-remove",
@@ -6541,6 +6543,8 @@ interface AgentVaultServiceCreateEvent {
     headerPrefix?: string;
     allowedMethods?: string[] | null;
     allowedPathPrefixes?: string[] | null;
+    // The fields each member sets for themselves, such as credential-value or credential-username.
+    memberProvidedFields?: string[];
     // Names and placeholders only. A sealed value must never reach an audit row.
     customHeaderNames?: string[];
     substitutionPlaceholders?: string[];
@@ -6561,6 +6565,8 @@ interface AgentVaultServiceUpdateEvent {
     headerPrefix?: string;
     allowedMethods?: string[] | null;
     allowedPathPrefixes?: string[] | null;
+    // The fields each member sets for themselves after the update, present when it touched the credential.
+    memberProvidedFields?: string[];
     customHeaderNames?: string[];
     customHeadersReplaced?: string[];
     substitutionPlaceholders?: string[];
@@ -6590,6 +6596,8 @@ interface AgentVaultVariableCreateEvent {
     accessBundleName?: string;
     variableId: string;
     key: string;
+    // global, or personal for a variable only its owner sees and uses. Absent on events from before personal ones.
+    scope?: string;
   };
 }
 
@@ -6600,6 +6608,8 @@ interface AgentVaultVariableUpdateEvent {
     accessBundleName?: string;
     variableId: string;
     key: string;
+    // global, or personal for a variable only its owner sees and uses. Absent on events from before personal ones.
+    scope?: string;
     // Present only when the update changed the key.
     previousKey?: string;
     valueReplaced: boolean;
@@ -6613,6 +6623,8 @@ interface AgentVaultVariableDeleteEvent {
     accessBundleName?: string;
     variableId: string;
     key: string;
+    // global, or personal for a variable only its owner sees and uses. Absent on events from before personal ones.
+    scope?: string;
   };
 }
 
@@ -6623,6 +6635,32 @@ interface AgentVaultVariableValueViewEvent {
     accessBundleName?: string;
     variableId: string;
     key: string;
+    // global, or personal for a variable only its owner sees and uses. Absent on events from before personal ones.
+    scope?: string;
+  };
+}
+
+// The personal values the actor set for a service that leaves some fields to each member. Field names only, never a value.
+interface AgentVaultPersonalValuesSetEvent {
+  type: EventType.AGENT_VAULT_PERSONAL_VALUES_SET;
+  metadata: {
+    accessBundleId: string;
+    accessBundleName: string;
+    serviceId: string;
+    serviceName: string;
+    // The fields this update set. A field it left out kept its saved value.
+    fields: string[];
+    variableKeys: string[];
+  };
+}
+
+interface AgentVaultPersonalValuesDeleteEvent {
+  type: EventType.AGENT_VAULT_PERSONAL_VALUES_DELETE;
+  metadata: {
+    accessBundleId: string;
+    accessBundleName: string;
+    serviceId: string;
+    serviceName: string;
   };
 }
 
@@ -8620,6 +8658,8 @@ export type Event =
   | AgentVaultVariableUpdateEvent
   | AgentVaultVariableDeleteEvent
   | AgentVaultVariableValueViewEvent
+  | AgentVaultPersonalValuesSetEvent
+  | AgentVaultPersonalValuesDeleteEvent
   | AgentVaultProductMemberAddEvent
   | AgentVaultProductMemberUpdateEvent
   | AgentVaultProductMemberRemoveEvent
