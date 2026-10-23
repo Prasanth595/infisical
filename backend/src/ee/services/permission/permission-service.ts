@@ -80,6 +80,7 @@ import {
   escapeHandlebarsMissingDict,
   expandLegacyForbidActions,
   fetchFolderScopedPrivileges,
+  fetchProjectFolderScopedPrivileges,
   getProjectPermissionFingerprint,
   interpolatePermissionRules,
   interpolateStoredIdentityRules,
@@ -942,6 +943,53 @@ export const permissionServiceFactory = ({
   };
 
   const getProjectPermissions: TPermissionServiceFactory["getProjectPermissions"] = async (projectId, orgId) => {
+    // The project-wide listings below leave folder grants out, so they are loaded once for the whole project and
+    // applied per actor the way getProjectPermission applies them: Secret Manager projects only, never to admins.
+    const project = await requestMemoize(requestMemoKeys.projectFindById(projectId), () =>
+      projectDAL.findById(projectId)
+    );
+    const folderScopedPrivilegesByActorId =
+      project?.type === ProjectType.SecretManager
+        ? await fetchProjectFolderScopedPrivileges(projectId, { additionalPrivilegeDAL, secretFolderDAL })
+        : new Map<string, TCachedFolderScopedPrivileges["privileges"]>();
+    const folderScopedPrivilegesOf = (actorId: string, roles: { role: string }[] = []) =>
+      roles.some(({ role }) => role === ProjectMembershipRole.Admin)
+        ? undefined
+        : folderScopedPrivilegesByActorId.get(actorId)?.filter(isActiveRole);
+
+    // Each of a member's roles and project-wide privileges as a permission of its own, for a caller that needs to
+    // know which of them grants something. Built on first use, and members whose source has the same rules share one.
+    const sourceAbilities = new Map<string, MongoAbility<ProjectPermissionSet>>();
+    const accessSourcesOf = (
+      roles: { id: string; role: string; permissions?: unknown }[],
+      privileges: { id: string; permissions?: unknown }[],
+      identityContext: Record<string, unknown>
+    ) => {
+      let sources: { key: string; permission: MongoAbility<ProjectPermissionSet> }[] | undefined;
+      return () => {
+        sources ??= [
+          ...roles.map(({ id, role, permissions }) => ({
+            key: `role:${id}`,
+            rules: buildProjectPermissionRules([{ role, permissions }])
+          })),
+          ...privileges.map(({ id, permissions }) => ({
+            key: `privilege:${id}`,
+            rules: buildProjectPermissionRules([{ role: ProjectMembershipRole.Custom, permissions }])
+          }))
+        ].map(({ key, rules }) => {
+          const interpolated = interpolatePermissionRules(rules, identityContext);
+          const rulesKey = JSON.stringify(interpolated);
+          let permission = sourceAbilities.get(rulesKey);
+          if (!permission) {
+            permission = createMongoAbility<ProjectPermissionSet>(interpolated, { conditionsMatcher });
+            sourceAbilities.set(rulesKey, permission);
+          }
+          return { key, permission };
+        });
+        return sources;
+      };
+    };
+
     // fetch user permissions
     const rawUserProjectPermissions = await permissionDAL.getProjectUserPermissions(projectId, orgId);
     const userPermissions = rawUserProjectPermissions.map((userProjectPermission) => {
@@ -953,7 +1001,11 @@ export const permissionServiceFactory = ({
           permissions
         })) || [];
 
-      const rules = buildProjectPermissionRules(rolePermissions.concat(additionalPrivileges));
+      const rules = buildProjectPermissionRules(
+        rolePermissions.concat(additionalPrivileges),
+        undefined,
+        folderScopedPrivilegesOf(userProjectPermission.userId, userProjectPermission.roles)
+      );
       const metadataKeyValuePair = escapeHandlebarsMissingDict(
         objectify(
           userProjectPermission.metadata,
@@ -962,13 +1014,14 @@ export const permissionServiceFactory = ({
         ),
         "identity.metadata"
       );
-      const interpolatedRules = interpolatePermissionRules(rules, {
+      const identityContext = {
         identity: {
           id: userProjectPermission.userId,
           username: userProjectPermission.username,
           metadata: metadataKeyValuePair
         }
-      });
+      };
+      const interpolatedRules = interpolatePermissionRules(rules, identityContext);
       const permission = createMongoAbility<ProjectPermissionSet>(interpolatedRules, {
         conditionsMatcher
       });
@@ -977,7 +1030,22 @@ export const permissionServiceFactory = ({
         permission,
         id: userProjectPermission.userId,
         membershipId: userProjectPermission.id,
-        name: userProjectPermission.username
+        name: userProjectPermission.username,
+        roles: (userProjectPermission.roles ?? []).map(
+          ({ id, role, customRoleSlug, customRoleId, customRoleName }) => ({
+            id,
+            role,
+            customRoleSlug,
+            customRoleId,
+            customRoleName
+          })
+        ),
+        additionalPrivileges: (userProjectPermission.additionalPrivileges ?? []).map(({ id, name }) => ({ id, name })),
+        accessSources: accessSourcesOf(
+          userProjectPermission.roles ?? [],
+          userProjectPermission.additionalPrivileges ?? [],
+          identityContext
+        )
       };
     });
 
@@ -992,7 +1060,11 @@ export const permissionServiceFactory = ({
           permissions
         })) || [];
 
-      const rules = buildProjectPermissionRules(rolePermissions.concat(additionalPrivileges));
+      const rules = buildProjectPermissionRules(
+        rolePermissions.concat(additionalPrivileges),
+        undefined,
+        folderScopedPrivilegesOf(identityProjectPermission.identityId, identityProjectPermission.roles)
+      );
       const metadataKeyValuePair = escapeHandlebarsMissingDict(
         objectify(
           identityProjectPermission.metadata,
@@ -1001,13 +1073,14 @@ export const permissionServiceFactory = ({
         ),
         "identity.metadata"
       );
-      const interpolatedRules = interpolatePermissionRules(rules, {
+      const identityContext = {
         identity: {
           id: identityProjectPermission.identityId,
           username: identityProjectPermission.username,
           metadata: metadataKeyValuePair
         }
-      });
+      };
+      const interpolatedRules = interpolatePermissionRules(rules, identityContext);
       const permission = createMongoAbility<ProjectPermissionSet>(interpolatedRules, {
         conditionsMatcher
       });
@@ -1016,7 +1089,25 @@ export const permissionServiceFactory = ({
         permission,
         id: identityProjectPermission.identityId,
         membershipId: identityProjectPermission.id,
-        name: identityProjectPermission.username
+        name: identityProjectPermission.username,
+        roles: (identityProjectPermission.roles ?? []).map(
+          ({ id, role, customRoleSlug, customRoleId, customRoleName }) => ({
+            id,
+            role,
+            customRoleSlug,
+            customRoleId,
+            customRoleName
+          })
+        ),
+        additionalPrivileges: (identityProjectPermission.additionalPrivileges ?? []).map(({ id, name }) => ({
+          id,
+          name
+        })),
+        accessSources: accessSourcesOf(
+          identityProjectPermission.roles ?? [],
+          identityProjectPermission.additionalPrivileges ?? [],
+          identityContext
+        )
       };
     });
 
@@ -1030,18 +1121,56 @@ export const permissionServiceFactory = ({
         conditionsMatcher
       });
 
+      // What a member gets through the group: the group's roles with that member's own folder grants on top, the
+      // same way their own permission is built, so a grant that narrows a folder narrows the group access too.
+      const memberPermissions = new Map<string, MongoAbility<ProjectPermissionSet>>();
+      const permissionForMember = (actorId: string) => {
+        const folderPrivileges = folderScopedPrivilegesOf(actorId, groupProjectPermission.roles);
+        if (!folderPrivileges?.length) return permission;
+        let memberPermission = memberPermissions.get(actorId);
+        if (!memberPermission) {
+          memberPermission = createMongoAbility<ProjectPermissionSet>(
+            buildProjectPermissionRules(rolePermissions, undefined, folderPrivileges),
+            { conditionsMatcher }
+          );
+          memberPermissions.set(actorId, memberPermission);
+        }
+        return memberPermission;
+      };
+
       return {
         permission,
+        permissionForMember,
         id: groupProjectPermission.groupId,
         membershipId: groupProjectPermission.id,
-        name: groupProjectPermission.username
+        name: groupProjectPermission.username,
+        roles: (groupProjectPermission.roles ?? []).map(({ role, customRoleSlug, customRoleId, customRoleName }) => ({
+          role,
+          customRoleSlug,
+          customRoleId,
+          customRoleName
+        }))
       };
     });
+
+    const folderAccessByActorId = new Map(
+      [...folderScopedPrivilegesByActorId].map(([actorId, privileges]) => [
+        actorId,
+        privileges.filter(isActiveRole).map(({ id, folderId, role, environmentSlug, secretPath }) => ({
+          id,
+          folderId,
+          role,
+          environmentSlug,
+          secretPath
+        }))
+      ])
+    );
 
     return {
       userPermissions,
       identityPermissions,
-      groupPermissions
+      groupPermissions,
+      folderAccessByActorId
     };
   };
 

@@ -162,19 +162,54 @@ export type TPermissionServiceFactory = {
       id: string;
       name: string;
       membershipId: string;
+      roles: {
+        // The role assignment's id.
+        id: string;
+        role: string;
+        customRoleSlug?: string | null;
+        customRoleId?: string | null;
+        customRoleName?: string | null;
+      }[];
+      additionalPrivileges: { id: string; name: string }[];
+      // Each role ("role:<assignment id>") and project-wide privilege ("privilege:<id>") as a permission of its own,
+      // without folder grants.
+      accessSources: () => { key: string; permission: MongoAbility<ProjectPermissionSet, MongoQuery> }[];
     }[];
     identityPermissions: {
       permission: MongoAbility<ProjectPermissionSet, MongoQuery>;
       id: string;
       name: string;
       membershipId: string;
+      roles: {
+        // The role assignment's id.
+        id: string;
+        role: string;
+        customRoleSlug?: string | null;
+        customRoleId?: string | null;
+        customRoleName?: string | null;
+      }[];
+      additionalPrivileges: { id: string; name: string }[];
+      // Each role ("role:<assignment id>") and project-wide privilege ("privilege:<id>") as a permission of its own,
+      // without folder grants.
+      accessSources: () => { key: string; permission: MongoAbility<ProjectPermissionSet, MongoQuery> }[];
     }[];
     groupPermissions: {
       permission: MongoAbility<ProjectPermissionSet, MongoQuery>;
+      // The group's roles with the given member's own folder grants applied on top.
+      permissionForMember: (actorId: string) => MongoAbility<ProjectPermissionSet, MongoQuery>;
       id: string;
       name: string;
       membershipId: string;
+      roles: {
+        role: string;
+        customRoleSlug?: string | null;
+        customRoleId?: string | null;
+        customRoleName?: string | null;
+      }[];
     }[];
+    // Each user's and identity's active folder grants, keyed by actor id, whether they are a direct member or
+    // reach the project through a group. Admins are listed too, though their grants are never applied.
+    folderAccessByActorId: Map<string, TProjectFolderScopedPrivilege[]>;
   }>;
   getOrgPermissionByRoles: (
     roles: string[],
